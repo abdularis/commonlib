@@ -1,66 +1,49 @@
 package jose
 
 import (
-	"context"
+	"crypto/ecdsa"
 	"crypto/rsa"
-	"crypto/x509"
-	"encoding/pem"
-	"fmt"
+	"github.com/abdularis/commonlib/crypto/keygen"
 	"github.com/lestrrat-go/jwx/jwa"
 	"github.com/lestrrat-go/jwx/jwe"
 	"github.com/lestrrat-go/jwx/jwt"
-	"github.com/pkg/errors"
 )
 
 // TokenClaims store all jwt claims
 type TokenClaims map[string]interface{}
 
-type Signature interface {
-	Sign(claims TokenClaims) ([]byte, error)
-	Verify(token []byte) (TokenClaims, error)
-}
-
-type Encryption interface {
-	Encrypt(token []byte) ([]byte, error)
-	Decrypt(token []byte) ([]byte, error)
-}
-
-// Jose is main interface to interact with the package
-type Jose interface {
-	GenerateJWS(claims TokenClaims) ([]byte, error)
-	GenerateJWE(claims TokenClaims) ([]byte, error)
-	VerifyJWS(token []byte) (TokenClaims, error)
-	VerifyJWE(token []byte) (TokenClaims, error)
-}
-
-type signatureImpl struct {
-	privateKey *rsa.PrivateKey
-	signAlgo   jwa.SignatureAlgorithm
-}
-
-type encryptionImpl struct {
-	privateKey     *rsa.PrivateKey
-	signAlgo       jwa.SignatureAlgorithm
-	keyEncAlgo     jwa.KeyEncryptionAlgorithm
-	contentEncAlgo jwa.ContentEncryptionAlgorithm
-}
-
-func parsePEMCertificate(pemPrivateKey []byte) (*rsa.PrivateKey, error) {
-	block, _ := pem.Decode(pemPrivateKey)
-	if block == nil {
-		return nil, errors.New("no PEM data found in the input bytes")
+type (
+	Signature struct {
+		privateKey interface{}
+		signAlgo   jwa.SignatureAlgorithm
 	}
-	return x509.ParsePKCS1PrivateKey(block.Bytes)
-}
 
-func NewSignature(privateKey *rsa.PrivateKey) Signature {
-	return &signatureImpl{
+	Encryption struct {
+		privateKey     interface{}
+		keyEncAlgo     jwa.KeyEncryptionAlgorithm
+		contentEncAlgo jwa.ContentEncryptionAlgorithm
+	}
+
+	Jose struct {
+		signature  *Signature
+		encryption *Encryption
+	}
+
+	Config struct {
+		SignatureAlgorithm      jwa.SignatureAlgorithm
+		KeyEncryptionAlgorithm  jwa.KeyEncryptionAlgorithm
+		ContentEncryptAlgorithm jwa.ContentEncryptionAlgorithm
+	}
+)
+
+func NewSignature(privateKey interface{}, signAlgorithm jwa.SignatureAlgorithm) *Signature {
+	return &Signature{
 		privateKey: privateKey,
-		signAlgo:   jwa.RS256,
+		signAlgo:   signAlgorithm,
 	}
 }
 
-func (s *signatureImpl) Sign(claims TokenClaims) ([]byte, error) {
+func (s *Signature) Sign(claims TokenClaims) ([]byte, error) {
 	token := jwt.New()
 	for key, val := range claims {
 		if err := token.Set(key, val); err != nil {
@@ -76,81 +59,93 @@ func (s *signatureImpl) Sign(claims TokenClaims) ([]byte, error) {
 	return signed, nil
 }
 
-func (s *signatureImpl) Verify(token []byte) (TokenClaims, error) {
-	t, err := jwt.Parse(token, jwt.WithVerify(s.signAlgo, s.privateKey.PublicKey))
+func (s *Signature) Verify(token []byte) (jwt.Token, error) {
+	t, err := jwt.Parse(token, jwt.WithVerify(s.signAlgo, getPublicKey(s.privateKey)))
 	if err != nil {
 		return nil, err
 	}
 
-	claimMap, err := t.AsMap(context.Background())
-	if err != nil {
-		return nil, fmt.Errorf("error converting claims to map: %v", claimMap)
-	}
-
 	if err = jwt.Validate(t); err != nil {
-		return claimMap, err
+		return t, err
 	}
 
-	return claimMap, nil
+	return t, nil
 }
 
-func NewEncryption(privateKey *rsa.PrivateKey) Encryption {
-	return &encryptionImpl{
+func NewEncryption(
+	privateKey interface{},
+	keyEncAlgo jwa.KeyEncryptionAlgorithm,
+	contentEncAlgo jwa.ContentEncryptionAlgorithm) *Encryption {
+	return &Encryption{
 		privateKey:     privateKey,
-		signAlgo:       jwa.RS256,
-		keyEncAlgo:     jwa.RSA1_5,
-		contentEncAlgo: jwa.A128CBC_HS256,
+		keyEncAlgo:     keyEncAlgo,
+		contentEncAlgo: contentEncAlgo,
 	}
 }
 
-func (e *encryptionImpl) Encrypt(token []byte) ([]byte, error) {
+func (e *Encryption) Encrypt(token []byte) ([]byte, error) {
 	return jwe.Encrypt(
 		token,
 		e.keyEncAlgo,
-		&e.privateKey.PublicKey,
+		getPublicKey(e.privateKey),
 		e.contentEncAlgo,
 		jwa.NoCompress)
 }
 
-func (e *encryptionImpl) Decrypt(token []byte) ([]byte, error) {
+func (e *Encryption) Decrypt(token []byte) ([]byte, error) {
 	return jwe.Decrypt(token, e.keyEncAlgo, e.privateKey)
 }
 
-type utilsImpl struct {
-	signature  Signature
-	encryption Encryption
+func getPublicKey(privateKey interface{}) interface{} {
+	var ptr interface{}
+	switch v := privateKey.(type) {
+	case rsa.PrivateKey:
+		ptr = &v
+	case ecdsa.PrivateKey:
+		ptr = &v
+	default:
+		ptr = v
+	}
+
+	switch rawKey := ptr.(type) {
+	case *rsa.PrivateKey:
+		return rawKey.PublicKey
+	case *ecdsa.PrivateKey:
+		return rawKey.PublicKey
+	default:
+		return rawKey
+	}
 }
 
-func NewJose(certificate string) (Jose, error) {
-	privateKey, err := parsePEMCertificate([]byte(certificate))
+func NewJose(pemCertificate string, config Config) (*Jose, error) {
+	privateKey, err := keygen.ParseKey([]byte(pemCertificate))
 	if err != nil {
 		return nil, err
 	}
 
-	return &utilsImpl{
-		signature:  NewSignature(privateKey),
-		encryption: NewEncryption(privateKey),
+	return &Jose{
+		signature:  NewSignature(privateKey, config.SignatureAlgorithm),
+		encryption: NewEncryption(privateKey, config.KeyEncryptionAlgorithm, config.ContentEncryptAlgorithm),
 	}, nil
 }
 
-func (u *utilsImpl) GenerateJWS(claims TokenClaims) ([]byte, error) {
+func (u *Jose) GenerateJWS(claims TokenClaims) ([]byte, error) {
 	return u.signature.Sign(claims)
 }
 
-func (u *utilsImpl) GenerateJWE(claims TokenClaims) ([]byte, error) {
+func (u *Jose) GenerateJWE(claims TokenClaims) ([]byte, error) {
 	signed, err := u.signature.Sign(claims)
 	if err != nil {
 		return nil, err
 	}
-
 	return u.encryption.Encrypt(signed)
 }
 
-func (u *utilsImpl) VerifyJWS(token []byte) (TokenClaims, error) {
+func (u *Jose) VerifyJWS(token []byte) (jwt.Token, error) {
 	return u.signature.Verify(token)
 }
 
-func (u *utilsImpl) VerifyJWE(token []byte) (TokenClaims, error) {
+func (u *Jose) VerifyJWE(token []byte) (jwt.Token, error) {
 	decrypted, err := u.encryption.Decrypt(token)
 	if err != nil {
 		return nil, err

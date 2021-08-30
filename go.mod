@@ -1,4 +1,4 @@
-module commonlib
+module github.com/abdularis/commonlib
 
 go 1.15
 
