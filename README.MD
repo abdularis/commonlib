@@ -2,5 +2,11 @@
 
 Index:
 - crypto
+  - jose
+  - keygen
+  - password
+  - random
+  - urlsigner
 - lock
 - types
+
